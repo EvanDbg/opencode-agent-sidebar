@@ -9,6 +9,7 @@ const TICK_INTERVAL_MS = 1000;
 const COMPLETION_RETENTION_MS = 3_000;
 const DESCRIPTION_MAX_LEN = 26;
 const COLLAPSED_KV_KEY = "agents-panel.collapsed";
+const MAIN_AGENT_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const BG_STATUS_PATTERN = /\[BACKGROUND TASK (COMPLETED|ERROR|TIMEOUT|CANCELLED|RETRYING)\]/;
 const BG_ID_IN_TEXT_PATTERN = /\*\*ID:\*\*\s*`?(bg_[A-Za-z0-9]+)`?/;
 const BG_ID_IN_OUTPUT_PATTERN = /Background Task ID:\s*(bg_[A-Za-z0-9]+)/;
@@ -513,6 +514,12 @@ function buildCountSuffix(total, live, done) {
     return `(${live})`;
 }
 function renderAgentLine(entry, tickNow) {
+    if (entry.kind === "main" && entry.status === "running") {
+        const frame = MAIN_AGENT_SPINNER_FRAMES[Math.floor(tickNow / TICK_INTERVAL_MS) % MAIN_AGENT_SPINNER_FRAMES.length];
+        return makeText(`  • ${entry.agent} Running ${frame}`, {
+            fg: pickLineColor(entry),
+        });
+    }
     const elapsedMs = entry.completedAt ? entry.completedAt - entry.startedAt : tickNow - entry.startedAt;
     const elapsed = formatDuration(elapsedMs);
     return makeText(`  • ${entry.agent} ${formatStatus(entry.status)} ${elapsed}`, {

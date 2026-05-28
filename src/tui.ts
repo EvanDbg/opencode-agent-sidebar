@@ -12,6 +12,7 @@ const TICK_INTERVAL_MS = 1000;
 const COMPLETION_RETENTION_MS = 3_000;
 const DESCRIPTION_MAX_LEN = 26;
 const COLLAPSED_KV_KEY = "agents-panel.collapsed";
+const MAIN_AGENT_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 type AgentKind = "main" | "foreground" | "background";
 type AgentStatus = "queued" | "running" | "completed" | "error";
@@ -589,6 +590,13 @@ function buildCountSuffix(total: number, live: number, done: number): string {
 }
 
 function renderAgentLine(entry: AgentEntry, tickNow: number): unknown {
+  if (entry.kind === "main" && entry.status === "running") {
+    const frame = MAIN_AGENT_SPINNER_FRAMES[Math.floor(tickNow / TICK_INTERVAL_MS) % MAIN_AGENT_SPINNER_FRAMES.length];
+    return makeText(`  • ${entry.agent} Running ${frame}`, {
+      fg: pickLineColor(entry),
+    });
+  }
+
   const elapsedMs = entry.completedAt ? entry.completedAt - entry.startedAt : tickNow - entry.startedAt;
   const elapsed = formatDuration(elapsedMs);
   return makeText(`  • ${entry.agent} ${formatStatus(entry.status)} ${elapsed}`, {
