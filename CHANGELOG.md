@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Stale `Queued` entries no longer reappear after a TUI restart when historical `task` / `delegate` parts are still recorded as `pending`. Replayed pending parts without reliable timestamps are ignored, old queued entries age out, and live `pending` → `running` updates now promote the row to `Running` before queued cleanup can remove it.
+
 ## [0.2.2] — 2026-05-07
 
 ### Fixed

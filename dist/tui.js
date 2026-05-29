@@ -7,6 +7,7 @@ const PLUGIN_VERSION = "0.2.4";
 const SIDEBAR_ORDER = 200;
 const TICK_INTERVAL_MS = 1000;
 const COMPLETION_RETENTION_MS = 3_000;
+const QUEUED_STALE_MS = 60_000;
 const DESCRIPTION_MAX_LEN = 26;
 const COLLAPSED_KV_KEY = "agents-panel.collapsed";
 const MAIN_AGENT_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -40,6 +41,15 @@ function resolveDescription(input, metadata) {
 }
 function makeKey(kind, id) {
     return `${kind}:${id}`;
+}
+function resolveStartedAt(part, fallbackStartedAt, now) {
+    const timestamp = part.state?.time?.start ?? part.time?.start ?? part.time?.created ?? fallbackStartedAt;
+    if (timestamp !== undefined)
+        return { value: timestamp, hasTimestamp: true };
+    return { value: now, hasTimestamp: false };
+}
+function isStaleQueued(startedAt, now) {
+    return now - startedAt > QUEUED_STALE_MS;
 }
 const tui = async (api) => {
     const active = new Map();
@@ -93,6 +103,14 @@ const tui = async (api) => {
         if (statusChanged)
             entry.status = nextStatus;
         return statusChanged || stampChanged;
+    };
+    const syncLiveToolEntry = (entry, agent, description, status) => {
+        let mutated = touchEntry(entry, agent, description);
+        if (entry.status !== status) {
+            entry.status = status;
+            mutated = true;
+        }
+        return mutated;
     };
     const promoteCallIDToBgID = (callID, bgID) => {
         const callKey = makeKey("background", callID);
@@ -201,7 +219,7 @@ const tui = async (api) => {
         });
         return true;
     };
-    const upsertToolPart = (sessionID, part) => {
+    const upsertToolPart = (sessionID, part, options = {}) => {
         if (part.type !== "tool")
             return false;
         if (part.tool !== "task" && part.tool !== "delegate")
@@ -218,11 +236,23 @@ const tui = async (api) => {
         const key = makeKey(kind, callID);
         const agent = resolveAgentName(input, metadata);
         const description = resolveDescription(input, metadata);
-        const startedAt = part.state?.time?.start ?? Date.now();
+        const current = options.now ?? Date.now();
+        const startedAt = resolveStartedAt(part, options.fallbackStartedAt, current);
         if (status === "pending" || status === "running") {
             const existing = active.get(key);
+            if (status === "pending" && options.source === "scan") {
+                if (!startedAt.hasTimestamp && !existing)
+                    return false;
+                if (startedAt.hasTimestamp && isStaleQueued(startedAt.value, current)) {
+                    return existing?.status === "queued" || !existing ? active.delete(key) : false;
+                }
+            }
+            if (existing && status === "running")
+                return syncLiveToolEntry(existing, agent, description, "running");
+            if (existing?.status === "queued" && isStaleQueued(existing.startedAt, current))
+                return active.delete(key);
             if (existing)
-                return touchEntry(existing, agent, description);
+                return syncLiveToolEntry(existing, agent, description, "queued");
             active.set(key, {
                 key,
                 sessionID,
@@ -230,7 +260,7 @@ const tui = async (api) => {
                 agent,
                 description,
                 status: status === "pending" ? "queued" : "running",
-                startedAt,
+                startedAt: startedAt.value,
                 callID,
             });
             return true;
@@ -313,6 +343,7 @@ const tui = async (api) => {
     };
     const scanSessionState = (sessionID) => {
         let mutated = false;
+        const current = Date.now();
         const messages = api.state.session.messages(sessionID);
         const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
         if (lastAssistant)
@@ -322,21 +353,23 @@ const tui = async (api) => {
                 continue;
             const parts = api.state.part(message.id);
             for (const part of parts) {
-                mutated = upsertToolPart(sessionID, part) || mutated;
+                mutated =
+                    upsertToolPart(sessionID, part, { source: "scan", now: current, fallbackStartedAt: message.time?.created }) || mutated;
                 mutated = upsertSubtaskPart(sessionID, part) || mutated;
                 mutated = upsertAgentPart(sessionID, part) || mutated;
                 // system-reminder parts lack time fields; mirror handlePart fallback so BG completion isn't dropped on rescan.
-                const completedAt = part.time?.end ?? part.time?.start ?? Date.now();
+                const completedAt = part.time?.end ?? part.time?.start ?? current;
                 mutated = handleBackgroundStatusText(sessionID, part, completedAt) || mutated;
             }
         }
         return mutated;
     };
     const handlePart = (sessionID, part) => {
-        const mutated = upsertToolPart(sessionID, part) ||
+        const current = Date.now();
+        const mutated = upsertToolPart(sessionID, part, { source: "live", now: current }) ||
             upsertSubtaskPart(sessionID, part) ||
             upsertAgentPart(sessionID, part) ||
-            handleBackgroundStatusText(sessionID, part, Date.now());
+            handleBackgroundStatusText(sessionID, part, current);
         if (mutated)
             bumpVersion();
     };
@@ -354,6 +387,10 @@ const tui = async (api) => {
         let pruned = false;
         for (const [key, entry] of active) {
             if (entry.completedAt && current - entry.completedAt > COMPLETION_RETENTION_MS) {
+                active.delete(key);
+                pruned = true;
+            }
+            else if (entry.status === "queued" && isStaleQueued(entry.startedAt, current)) {
                 active.delete(key);
                 pruned = true;
             }

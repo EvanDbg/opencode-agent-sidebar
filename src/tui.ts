@@ -10,6 +10,7 @@ const PLUGIN_VERSION = "0.2.4";
 const SIDEBAR_ORDER = 200;
 const TICK_INTERVAL_MS = 1000;
 const COMPLETION_RETENTION_MS = 3_000;
+const QUEUED_STALE_MS = 60_000;
 const DESCRIPTION_MAX_LEN = 26;
 const COLLAPSED_KV_KEY = "agents-panel.collapsed";
 const MAIN_AGENT_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -75,6 +76,19 @@ type EventProperties = {
   sessionID?: string;
 };
 
+type ToolPartSource = "live" | "scan";
+
+type ToolPartOptions = {
+  source?: ToolPartSource;
+  now?: number;
+  fallbackStartedAt?: number;
+};
+
+type StartedAtResult = {
+  value: number;
+  hasTimestamp: boolean;
+};
+
 const BG_STATUS_PATTERN = /\[BACKGROUND TASK (COMPLETED|ERROR|TIMEOUT|CANCELLED|RETRYING)\]/;
 const BG_ID_IN_TEXT_PATTERN = /\*\*ID:\*\*\s*`?(bg_[A-Za-z0-9]+)`?/;
 const BG_ID_IN_OUTPUT_PATTERN = /Background Task ID:\s*(bg_[A-Za-z0-9]+)/;
@@ -109,6 +123,16 @@ function resolveDescription(input: Record<string, unknown>, metadata: Record<str
 
 function makeKey(kind: AgentKind, id: string): string {
   return `${kind}:${id}`;
+}
+
+function resolveStartedAt(part: EventPart, fallbackStartedAt: number | undefined, now: number): StartedAtResult {
+  const timestamp = part.state?.time?.start ?? part.time?.start ?? part.time?.created ?? fallbackStartedAt;
+  if (timestamp !== undefined) return { value: timestamp, hasTimestamp: true };
+  return { value: now, hasTimestamp: false };
+}
+
+function isStaleQueued(startedAt: number, now: number): boolean {
+  return now - startedAt > QUEUED_STALE_MS;
 }
 
 const tui: TuiPlugin = async (api: TuiPluginApi) => {
@@ -167,6 +191,15 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     if (stampChanged) entry.completedAt = completedAt;
     if (statusChanged) entry.status = nextStatus;
     return statusChanged || stampChanged;
+  };
+
+  const syncLiveToolEntry = (entry: AgentEntry, agent: string, description: string, status: AgentStatus): boolean => {
+    let mutated = touchEntry(entry, agent, description);
+    if (entry.status !== status) {
+      entry.status = status;
+      mutated = true;
+    }
+    return mutated;
   };
 
   const promoteCallIDToBgID = (callID: string, bgID: string): boolean => {
@@ -271,7 +304,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     return true;
   };
 
-  const upsertToolPart = (sessionID: string, part: EventPart): boolean => {
+  const upsertToolPart = (sessionID: string, part: EventPart, options: ToolPartOptions = {}): boolean => {
     if (part.type !== "tool") return false;
     if (part.tool !== "task" && part.tool !== "delegate") return false;
 
@@ -287,11 +320,20 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     const key = makeKey(kind, callID);
     const agent = resolveAgentName(input, metadata);
     const description = resolveDescription(input, metadata);
-    const startedAt = part.state?.time?.start ?? Date.now();
+    const current = options.now ?? Date.now();
+    const startedAt = resolveStartedAt(part, options.fallbackStartedAt, current);
 
     if (status === "pending" || status === "running") {
       const existing = active.get(key);
-      if (existing) return touchEntry(existing, agent, description);
+      if (status === "pending" && options.source === "scan") {
+        if (!startedAt.hasTimestamp && !existing) return false;
+        if (startedAt.hasTimestamp && isStaleQueued(startedAt.value, current)) {
+          return existing?.status === "queued" || !existing ? active.delete(key) : false;
+        }
+      }
+      if (existing && status === "running") return syncLiveToolEntry(existing, agent, description, "running");
+      if (existing?.status === "queued" && isStaleQueued(existing.startedAt, current)) return active.delete(key);
+      if (existing) return syncLiveToolEntry(existing, agent, description, "queued");
       active.set(key, {
         key,
         sessionID,
@@ -299,7 +341,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         agent,
         description,
         status: status === "pending" ? "queued" : "running",
-        startedAt,
+        startedAt: startedAt.value,
         callID,
       });
       return true;
@@ -383,6 +425,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   const scanSessionState = (sessionID: string): boolean => {
     let mutated = false;
+    const current = Date.now();
     const messages = api.state.session.messages(sessionID) as ReadonlyArray<EventMessage>;
     const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
     if (lastAssistant) mutated = upsertMainMessage(sessionID, lastAssistant) || mutated;
@@ -391,11 +434,12 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       if (!message.id) continue;
       const parts = api.state.part(message.id) as ReadonlyArray<EventPart>;
       for (const part of parts) {
-        mutated = upsertToolPart(sessionID, part) || mutated;
+        mutated =
+          upsertToolPart(sessionID, part, { source: "scan", now: current, fallbackStartedAt: message.time?.created }) || mutated;
         mutated = upsertSubtaskPart(sessionID, part) || mutated;
         mutated = upsertAgentPart(sessionID, part) || mutated;
         // system-reminder parts lack time fields; mirror handlePart fallback so BG completion isn't dropped on rescan.
-        const completedAt = part.time?.end ?? part.time?.start ?? Date.now();
+        const completedAt = part.time?.end ?? part.time?.start ?? current;
         mutated = handleBackgroundStatusText(sessionID, part, completedAt) || mutated;
       }
     }
@@ -403,11 +447,12 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   };
 
   const handlePart = (sessionID: string, part: EventPart): void => {
+    const current = Date.now();
     const mutated =
-      upsertToolPart(sessionID, part) ||
+      upsertToolPart(sessionID, part, { source: "live", now: current }) ||
       upsertSubtaskPart(sessionID, part) ||
       upsertAgentPart(sessionID, part) ||
-      handleBackgroundStatusText(sessionID, part, Date.now());
+      handleBackgroundStatusText(sessionID, part, current);
     if (mutated) bumpVersion();
   };
 
@@ -424,6 +469,9 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     let pruned = false;
     for (const [key, entry] of active) {
       if (entry.completedAt && current - entry.completedAt > COMPLETION_RETENTION_MS) {
+        active.delete(key);
+        pruned = true;
+      } else if (entry.status === "queued" && isStaleQueued(entry.startedAt, current)) {
         active.delete(key);
         pruned = true;
       }
