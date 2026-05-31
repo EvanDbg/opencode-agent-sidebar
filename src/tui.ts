@@ -1,5 +1,5 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
-import type { KeyEvent, MouseEvent, Renderable } from "@opentui/core";
+import type { MouseEvent } from "@opentui/core";
 import { MouseButton } from "@opentui/core";
 import { createElement, insert, setProp } from "@opentui/solid";
 import { createSignal } from "solid-js";
@@ -585,8 +585,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   }
 
   function buildFloatingPanel(): unknown {
-    const box = createElement("box") as Renderable;
-    let floatingPanelFocused = false;
+    const box = createElement("box");
     setProp(box, "position", "absolute");
     setProp(box, "top", FLOATING_PANEL_TOP);
     setProp(box, "right", FLOATING_PANEL_RIGHT);
@@ -597,7 +596,6 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     setProp(box, "border", true);
     setProp(box, "borderColor", "gray");
     setProp(box, "backgroundColor", "black");
-    setProp(box, "focusable", false);
 
     insert(box, () => {
       const sessionID = currentSessionID();
@@ -605,17 +603,13 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       setProp(box, "visible", visible);
       if (!visible) {
         setFloatingExpanded(false);
-        resetFloatingPanelFocus(box);
         return [];
       }
 
       setProp(box, "top", floatingPanelTop());
       const isExpanded = floatingExpanded();
       setProp(box, "width", isExpanded ? floatingExpandedPanelWidth() : floatingPanelWidth());
-      setProp(box, "focusable", isExpanded);
-      setProp(box, "onMouseDown", isExpanded ? consumeFloatingPanelMouseDown : expandFloatingPanelOnMouseDown);
-      setProp(box, "onKeyDown", isExpanded ? closeFloatingExpandedOnEscape : undefined);
-      syncFloatingPanelFocus(box, isExpanded);
+      setProp(box, "onMouseDown", isExpanded ? collapseFloatingPanelOnMouseDown : expandFloatingPanelOnMouseDown);
       const mutatedFromScan = scanSessionState(sessionID);
       if (mutatedFromScan) queueMicrotask(bumpVersion);
       version();
@@ -626,24 +620,6 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     });
 
     return box;
-
-    function syncFloatingPanelFocus(panel: Renderable, isExpanded: boolean): void {
-      if (isExpanded) {
-        if (!floatingPanelFocused) {
-          panel.focus();
-          floatingPanelFocused = true;
-        }
-        return;
-      }
-
-      resetFloatingPanelFocus(panel);
-    }
-
-    function resetFloatingPanelFocus(panel: Renderable): void {
-      if (!floatingPanelFocused) return;
-      if (panel.focused) panel.blur();
-      floatingPanelFocused = false;
-    }
   }
 
   function expandFloatingPanelOnMouseDown(event: MouseEvent): void {
@@ -652,16 +628,10 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     setFloatingExpanded(true);
   }
 
-  function consumeFloatingPanelMouseDown(event: MouseEvent): void {
+  function collapseFloatingPanelOnMouseDown(event: MouseEvent): void {
     if (event.button !== MouseButton.LEFT) return;
     event.stopPropagation();
-  }
-
-  function closeFloatingExpandedOnEscape(event: KeyEvent): void {
-    if (!api.keybind.match("escape", event) && event.name !== "escape") return;
     setFloatingExpanded(false);
-    event.preventDefault();
-    event.stopPropagation();
   }
 
   function currentSessionID(): string | undefined {
@@ -722,10 +692,6 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   }
 
   function renderFloatingExpandedChildren(sessionID: string, tickNow: number): unknown[] {
-    const sessionApi = api.state.session as typeof api.state.session & {
-      get?: (sessionID: string) => SessionInfo | undefined;
-    };
-    const session = sessionApi.get?.(sessionID);
     const stats = collectAgentStats(sessionID, active);
     const main = stats.entries.filter((entry) => entry.kind === "main" && isLive(entry));
     const fg = stats.entries.filter((entry) => entry.kind === "foreground");
@@ -734,7 +700,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     const innerWidth = floatingExpandedPanelInnerWidth();
     const maxRows = floatingExpandedPanelMaxRows();
     const header = "Agents Detail";
-    const hint = "Esc to close";
+    const hint = "Click to close";
     const headerGap = Math.max(1, innerWidth - header.length - hint.length);
     const rows: unknown[] = [
       makeText(truncate(`${header}${" ".repeat(headerGap)}${hint}`, innerWidth), {
@@ -744,10 +710,6 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         selectable: false,
       }),
     ];
-
-    if (innerWidth >= 24 && maxRows >= 6) {
-      rows.push(renderFloatingLine(`Session: ${session?.title ?? "Untitled session"}`, innerWidth));
-    }
 
     rows.push(renderFloatingLine("Agents", innerWidth));
     const agentRows: unknown[] = [];

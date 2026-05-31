@@ -488,7 +488,6 @@ const tui = async (api) => {
     }
     function buildFloatingPanel() {
         const box = createElement("box");
-        let floatingPanelFocused = false;
         setProp(box, "position", "absolute");
         setProp(box, "top", FLOATING_PANEL_TOP);
         setProp(box, "right", FLOATING_PANEL_RIGHT);
@@ -499,23 +498,18 @@ const tui = async (api) => {
         setProp(box, "border", true);
         setProp(box, "borderColor", "gray");
         setProp(box, "backgroundColor", "black");
-        setProp(box, "focusable", false);
         insert(box, () => {
             const sessionID = currentSessionID();
             const visible = sessionID !== undefined && shouldShowFloatingPanel(sessionID);
             setProp(box, "visible", visible);
             if (!visible) {
                 setFloatingExpanded(false);
-                resetFloatingPanelFocus(box);
                 return [];
             }
             setProp(box, "top", floatingPanelTop());
             const isExpanded = floatingExpanded();
             setProp(box, "width", isExpanded ? floatingExpandedPanelWidth() : floatingPanelWidth());
-            setProp(box, "focusable", isExpanded);
-            setProp(box, "onMouseDown", isExpanded ? consumeFloatingPanelMouseDown : expandFloatingPanelOnMouseDown);
-            setProp(box, "onKeyDown", isExpanded ? closeFloatingExpandedOnEscape : undefined);
-            syncFloatingPanelFocus(box, isExpanded);
+            setProp(box, "onMouseDown", isExpanded ? collapseFloatingPanelOnMouseDown : expandFloatingPanelOnMouseDown);
             const mutatedFromScan = scanSessionState(sessionID);
             if (mutatedFromScan)
                 queueMicrotask(bumpVersion);
@@ -526,23 +520,6 @@ const tui = async (api) => {
             return rows;
         });
         return box;
-        function syncFloatingPanelFocus(panel, isExpanded) {
-            if (isExpanded) {
-                if (!floatingPanelFocused) {
-                    panel.focus();
-                    floatingPanelFocused = true;
-                }
-                return;
-            }
-            resetFloatingPanelFocus(panel);
-        }
-        function resetFloatingPanelFocus(panel) {
-            if (!floatingPanelFocused)
-                return;
-            if (panel.focused)
-                panel.blur();
-            floatingPanelFocused = false;
-        }
     }
     function expandFloatingPanelOnMouseDown(event) {
         if (event.button !== MouseButton.LEFT)
@@ -550,17 +527,11 @@ const tui = async (api) => {
         event.stopPropagation();
         setFloatingExpanded(true);
     }
-    function consumeFloatingPanelMouseDown(event) {
+    function collapseFloatingPanelOnMouseDown(event) {
         if (event.button !== MouseButton.LEFT)
             return;
         event.stopPropagation();
-    }
-    function closeFloatingExpandedOnEscape(event) {
-        if (!api.keybind.match("escape", event) && event.name !== "escape")
-            return;
         setFloatingExpanded(false);
-        event.preventDefault();
-        event.stopPropagation();
     }
     function currentSessionID() {
         const route = api.route.current;
@@ -610,8 +581,6 @@ const tui = async (api) => {
         return rows;
     }
     function renderFloatingExpandedChildren(sessionID, tickNow) {
-        const sessionApi = api.state.session;
-        const session = sessionApi.get?.(sessionID);
         const stats = collectAgentStats(sessionID, active);
         const main = stats.entries.filter((entry) => entry.kind === "main" && isLive(entry));
         const fg = stats.entries.filter((entry) => entry.kind === "foreground");
@@ -620,7 +589,7 @@ const tui = async (api) => {
         const innerWidth = floatingExpandedPanelInnerWidth();
         const maxRows = floatingExpandedPanelMaxRows();
         const header = "Agents Detail";
-        const hint = "Esc to close";
+        const hint = "Click to close";
         const headerGap = Math.max(1, innerWidth - header.length - hint.length);
         const rows = [
             makeText(truncate(`${header}${" ".repeat(headerGap)}${hint}`, innerWidth), {
@@ -630,9 +599,6 @@ const tui = async (api) => {
                 selectable: false,
             }),
         ];
-        if (innerWidth >= 24 && maxRows >= 6) {
-            rows.push(renderFloatingLine(`Session: ${session?.title ?? "Untitled session"}`, innerWidth));
-        }
         rows.push(renderFloatingLine("Agents", innerWidth));
         const agentRows = [];
         if (stats.entries.length === 0) {
