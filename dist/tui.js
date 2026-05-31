@@ -5,6 +5,15 @@ import { createUpdateNotifier } from "./update-notifier.js";
 const PLUGIN_ID = "subagent-sidebar";
 const PLUGIN_VERSION = "0.2.4";
 const SIDEBAR_ORDER = 200;
+const SIDEBAR_AUTO_WIDE_WIDTH = 120;
+const FLOATING_PANEL_TOP = 2;
+const FLOATING_PANEL_TOAST_TOP = 8;
+const FLOATING_PANEL_RIGHT = 2;
+const FLOATING_PANEL_MAX_WIDTH = 44;
+const FLOATING_EXPANDED_PANEL_MAX_WIDTH = 72;
+const FLOATING_EXPANDED_PANEL_MAX_HEIGHT = 22;
+const FLOATING_PANEL_BORDER_ROWS = 2;
+const DEFAULT_TOAST_DURATION_MS = 5_000;
 const TICK_INTERVAL_MS = 1000;
 const COMPLETION_RETENTION_MS = 3_000;
 const QUEUED_STALE_MS = 60_000;
@@ -57,6 +66,9 @@ const tui = async (api) => {
     const [version, setVersion] = createSignal(0);
     const [collapsed, setCollapsed] = createSignal(api.kv.get(COLLAPSED_KV_KEY, false));
     const [updateStatus, setUpdateStatus] = createSignal(null);
+    const [floatingPanelTop, setFloatingPanelTop] = createSignal(FLOATING_PANEL_TOP);
+    const [floatingExpanded, setFloatingExpanded] = createSignal(false);
+    let toastTimer;
     const bumpVersion = () => {
         setVersion((value) => value + 1);
     };
@@ -302,7 +314,7 @@ const tui = async (api) => {
         }
         return false;
     };
-    const handleBackgroundStatusText = (sessionID, part, completedAt) => {
+    const handleBackgroundStatusText = (part, completedAt) => {
         if (part.type !== "text")
             return false;
         const body = part.text ?? "";
@@ -359,7 +371,7 @@ const tui = async (api) => {
                 mutated = upsertAgentPart(sessionID, part) || mutated;
                 // system-reminder parts lack time fields; mirror handlePart fallback so BG completion isn't dropped on rescan.
                 const completedAt = part.time?.end ?? part.time?.start ?? current;
-                mutated = handleBackgroundStatusText(sessionID, part, completedAt) || mutated;
+                mutated = handleBackgroundStatusText(part, completedAt) || mutated;
             }
         }
         return mutated;
@@ -369,7 +381,7 @@ const tui = async (api) => {
         const mutated = upsertToolPart(sessionID, part, { source: "live", now: current }) ||
             upsertSubtaskPart(sessionID, part) ||
             upsertAgentPart(sessionID, part) ||
-            handleBackgroundStatusText(sessionID, part, current);
+            handleBackgroundStatusText(part, current);
         if (mutated)
             bumpVersion();
     };
@@ -423,9 +435,20 @@ const tui = async (api) => {
             if (active.delete(fgKey) || active.delete(bgKey))
                 bumpVersion();
         }),
+        api.event.on("tui.toast.show", (event) => {
+            if (toastTimer)
+                clearTimeout(toastTimer);
+            setFloatingPanelTop(FLOATING_PANEL_TOAST_TOP);
+            toastTimer = setTimeout(() => {
+                setFloatingPanelTop(FLOATING_PANEL_TOP);
+                toastTimer = undefined;
+            }, event.properties.duration ?? DEFAULT_TOAST_DURATION_MS);
+        }),
     ];
     api.lifecycle.onDispose(() => {
         clearInterval(tickTimer);
+        if (toastTimer)
+            clearTimeout(toastTimer);
         updateNotifier.dispose();
         unregisterCommand();
         for (const unsubscribe of unsubscribers)
@@ -435,12 +458,15 @@ const tui = async (api) => {
     api.slots.register({
         order: SIDEBAR_ORDER,
         slots: {
+            app() {
+                return buildFloatingPanel();
+            },
             sidebar_content(_ctx, props) {
-                return buildPanel(props.session_id);
+                return buildSidebarPanel(props.session_id);
             },
         },
     });
-    function buildPanel(sessionID) {
+    function buildSidebarPanel(sessionID) {
         const box = createElement("box");
         setProp(box, "flexDirection", "column");
         setProp(box, "paddingTop", 1);
@@ -460,32 +486,274 @@ const tui = async (api) => {
         });
         return box;
     }
-    function renderChildren(sessionID, tickNow, isCollapsed, status) {
-        const inSession = [];
-        for (const entry of active.values()) {
-            if (entry.sessionID === sessionID)
-                inSession.push(entry);
+    function buildFloatingPanel() {
+        const box = createElement("box");
+        let floatingPanelFocused = false;
+        setProp(box, "position", "absolute");
+        setProp(box, "top", FLOATING_PANEL_TOP);
+        setProp(box, "right", FLOATING_PANEL_RIGHT);
+        setProp(box, "width", floatingPanelWidth());
+        setProp(box, "overflow", "hidden");
+        setProp(box, "flexDirection", "column");
+        setProp(box, "paddingX", 1);
+        setProp(box, "border", true);
+        setProp(box, "borderColor", "gray");
+        setProp(box, "backgroundColor", "black");
+        setProp(box, "focusable", false);
+        insert(box, () => {
+            const sessionID = currentSessionID();
+            const visible = sessionID !== undefined && shouldShowFloatingPanel(sessionID);
+            setProp(box, "visible", visible);
+            if (!visible) {
+                setFloatingExpanded(false);
+                resetFloatingPanelFocus(box);
+                return [];
+            }
+            setProp(box, "top", floatingPanelTop());
+            const isExpanded = floatingExpanded();
+            setProp(box, "width", isExpanded ? floatingExpandedPanelWidth() : floatingPanelWidth());
+            setProp(box, "focusable", isExpanded);
+            setProp(box, "onMouseDown", isExpanded ? consumeFloatingPanelMouseDown : expandFloatingPanelOnMouseDown);
+            setProp(box, "onKeyDown", isExpanded ? closeFloatingExpandedOnEscape : undefined);
+            syncFloatingPanelFocus(box, isExpanded);
+            const mutatedFromScan = scanSessionState(sessionID);
+            if (mutatedFromScan)
+                queueMicrotask(bumpVersion);
+            version();
+            const tick = now();
+            const rows = isExpanded ? renderFloatingExpandedChildren(sessionID, tick) : renderFloatingChildren(sessionID, tick);
+            setProp(box, "height", rows.length + FLOATING_PANEL_BORDER_ROWS);
+            return rows;
+        });
+        return box;
+        function syncFloatingPanelFocus(panel, isExpanded) {
+            if (isExpanded) {
+                if (!floatingPanelFocused) {
+                    panel.focus();
+                    floatingPanelFocused = true;
+                }
+                return;
+            }
+            resetFloatingPanelFocus(panel);
         }
-        inSession.sort(compareEntriesForDisplay);
-        const main = inSession.filter((entry) => entry.kind === "main" && isLive(entry));
-        const fg = inSession.filter((entry) => entry.kind === "foreground");
-        const bg = inSession.filter((entry) => entry.kind === "background");
-        const visibleEntries = [...main, ...fg, ...bg];
-        const live = visibleEntries.filter(isLive).length;
-        const done = visibleEntries.length - live;
-        const nodes = [renderHeader(visibleEntries.length, live, done, isCollapsed, status, toggleCollapsed)];
+        function resetFloatingPanelFocus(panel) {
+            if (!floatingPanelFocused)
+                return;
+            if (panel.focused)
+                panel.blur();
+            floatingPanelFocused = false;
+        }
+    }
+    function expandFloatingPanelOnMouseDown(event) {
+        if (event.button !== MouseButton.LEFT)
+            return;
+        event.stopPropagation();
+        setFloatingExpanded(true);
+    }
+    function consumeFloatingPanelMouseDown(event) {
+        if (event.button !== MouseButton.LEFT)
+            return;
+        event.stopPropagation();
+    }
+    function closeFloatingExpandedOnEscape(event) {
+        if (!api.keybind.match("escape", event) && event.name !== "escape")
+            return;
+        setFloatingExpanded(false);
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    function currentSessionID() {
+        const route = api.route.current;
+        if (route.name !== "session" || !route.params)
+            return undefined;
+        const sessionID = route.params.sessionID;
+        return typeof sessionID === "string" ? sessionID : undefined;
+    }
+    function shouldShowFloatingPanel(sessionID) {
+        const sessionApi = api.state.session;
+        const session = sessionApi.get?.(sessionID);
+        if (session?.parentID)
+            return false;
+        return api.renderer.terminalWidth <= SIDEBAR_AUTO_WIDE_WIDTH || api.kv.get("sidebar", "auto") === "hide";
+    }
+    function floatingPanelWidth() {
+        return Math.max(1, Math.min(FLOATING_PANEL_MAX_WIDTH, api.renderer.terminalWidth - 6));
+    }
+    function floatingExpandedPanelWidth() {
+        return Math.max(1, Math.min(FLOATING_EXPANDED_PANEL_MAX_WIDTH, api.renderer.terminalWidth - 6));
+    }
+    function floatingExpandedPanelMaxRows() {
+        return Math.max(3, Math.min(FLOATING_EXPANDED_PANEL_MAX_HEIGHT, api.renderer.terminalHeight - floatingPanelTop() - 2));
+    }
+    function renderFloatingChildren(sessionID, tickNow) {
+        const sessionApi = api.state.session;
+        const session = sessionApi.get?.(sessionID);
+        const stats = collectAgentStats(sessionID, active);
+        const todos = api.state.session.todo(sessionID);
+        const innerWidth = floatingPanelInnerWidth();
+        const status = buildFloatingStatus(stats.live, stats.done);
+        const headerGap = Math.max(1, innerWidth - "Agents".length - status.length);
+        const rows = [
+            makeText(truncate(`Agents${" ".repeat(headerGap)}${status}`, innerWidth), {
+                fg: "white",
+                bold: true,
+                width: "100%",
+                selectable: false,
+            }),
+        ];
+        if (innerWidth >= 20) {
+            rows.push(renderFloatingLine(`Session: ${session?.title ?? "Untitled session"}`, innerWidth));
+        }
+        rows.push(renderFloatingLine(buildFloatingAgentSummary(stats.entries), innerWidth));
+        rows.push(renderFloatingLine(buildFloatingTodoSummary(todos), innerWidth));
+        rows.push(renderFloatingLine(formatFloatingActivity(stats.entries, todos, tickNow), innerWidth));
+        return rows;
+    }
+    function renderFloatingExpandedChildren(sessionID, tickNow) {
+        const sessionApi = api.state.session;
+        const session = sessionApi.get?.(sessionID);
+        const stats = collectAgentStats(sessionID, active);
+        const main = stats.entries.filter((entry) => entry.kind === "main" && isLive(entry));
+        const fg = stats.entries.filter((entry) => entry.kind === "foreground");
+        const bg = stats.entries.filter((entry) => entry.kind === "background");
+        const todos = api.state.session.todo(sessionID);
+        const innerWidth = floatingExpandedPanelInnerWidth();
+        const maxRows = floatingExpandedPanelMaxRows();
+        const header = "Agents Detail";
+        const hint = "Esc to close";
+        const headerGap = Math.max(1, innerWidth - header.length - hint.length);
+        const rows = [
+            makeText(truncate(`${header}${" ".repeat(headerGap)}${hint}`, innerWidth), {
+                fg: "white",
+                bold: true,
+                width: "100%",
+                selectable: false,
+            }),
+        ];
+        if (innerWidth >= 24 && maxRows >= 6) {
+            rows.push(renderFloatingLine(`Session: ${session?.title ?? "Untitled session"}`, innerWidth));
+        }
+        rows.push(renderFloatingLine("Agents", innerWidth));
+        const agentRows = [];
+        if (stats.entries.length === 0) {
+            agentRows.push(renderFloatingLine("  idle", innerWidth));
+        }
+        else {
+            appendGroup(agentRows, "main", main, tickNow, false, innerWidth);
+            appendGroup(agentRows, "foreground", fg, tickNow, main.length > 0 || bg.length > 0, innerWidth);
+            appendGroup(agentRows, "background", bg, tickNow, main.length > 0 || fg.length > 0, innerWidth);
+        }
+        const todoRows = renderFloatingTodoRows(todos, innerWidth);
+        const availableRowsAfterSections = Math.max(0, maxRows - rows.length - 1);
+        const minimumTodoRows = Math.min(todoRows.length, availableRowsAfterSections, todos.length > 1 ? 2 : 1);
+        const availableAgentRows = Math.max(0, availableRowsAfterSections - minimumTodoRows);
+        rows.push(...limitFloatingAgentRows(agentRows, availableAgentRows, innerWidth));
+        rows.push(renderFloatingLine("Todos", innerWidth));
+        const availableTodoRows = Math.max(0, maxRows - rows.length);
+        rows.push(...limitFloatingTodoRows(todoRows, availableTodoRows, todos, innerWidth));
+        return rows;
+    }
+    function floatingPanelInnerWidth() {
+        return Math.max(1, floatingPanelWidth() - 2);
+    }
+    function floatingExpandedPanelInnerWidth() {
+        return Math.max(1, floatingExpandedPanelWidth() - 2);
+    }
+    function renderFloatingLine(content, width) {
+        return renderMutedLine(truncate(content, width));
+    }
+    function buildFloatingStatus(live, done) {
+        if (live === 0 && done > 0)
+            return "done";
+        if (live === 0)
+            return "idle";
+        return live === 1 ? "1 run" : `${live} run`;
+    }
+    function buildFloatingAgentSummary(entries) {
+        const main = entries.some((entry) => entry.kind === "main");
+        const subagents = entries.filter((entry) => entry.kind === "foreground" || entry.kind === "background").length;
+        if (!main && subagents === 0)
+            return "Agents: none";
+        if (main && subagents === 0)
+            return "Agents: main";
+        const label = subagents === 1 ? "1 subagent" : `${subagents} subagents`;
+        return main ? `Agents: main + ${label}` : `Agents: ${label}`;
+    }
+    function buildFloatingTodoSummary(todos) {
+        if (todos.length === 0)
+            return "Todos: none";
+        const done = todos.filter((todo) => todo.status === "completed").length;
+        const active = todos.filter(isActiveTodo).length;
+        if (active > 0)
+            return `Todos: ${done}/${todos.length} done - ${active} active`;
+        const pending = todos.length - done;
+        const pendingSuffix = pending > 0 ? ` - ${pending} pending` : "";
+        return `Todos: ${done}/${todos.length} done${pendingSuffix}`;
+    }
+    function renderChildren(sessionID, tickNow, isCollapsed, status, options = {}) {
+        const stats = collectAgentStats(sessionID, active);
+        const main = stats.entries.filter((entry) => entry.kind === "main" && isLive(entry));
+        const fg = stats.entries.filter((entry) => entry.kind === "foreground");
+        const bg = stats.entries.filter((entry) => entry.kind === "background");
+        const onToggle = options.interactiveHeader === false ? undefined : toggleCollapsed;
+        const nodes = [renderHeader(stats.total, stats.live, stats.done, isCollapsed, status, onToggle)];
         if (isCollapsed)
-            return nodes;
-        if (visibleEntries.length === 0) {
+            return limitRows(nodes, options.maxRows);
+        if (stats.entries.length === 0) {
             nodes.push(renderMutedLine("  idle"));
-            return nodes;
+            return limitRows(nodes, options.maxRows);
         }
         appendGroup(nodes, "main", main, tickNow, false);
         appendGroup(nodes, "foreground", fg, tickNow, main.length > 0 || bg.length > 0);
         appendGroup(nodes, "background", bg, tickNow, main.length > 0 || fg.length > 0);
-        return nodes;
+        return limitRows(nodes, options.maxRows);
     }
 };
+function limitRows(nodes, maxRows) {
+    return maxRows === undefined ? nodes : nodes.slice(0, maxRows);
+}
+function collectAgentStats(sessionID, active) {
+    const entries = Array.from(active.values())
+        .filter((entry) => entry.sessionID === sessionID)
+        .sort(compareEntriesForDisplay);
+    const visibleEntries = entries.filter((entry) => entry.kind === "main" || entry.kind === "foreground" || entry.kind === "background");
+    const live = visibleEntries.filter(isLive).length;
+    return {
+        entries: visibleEntries,
+        total: visibleEntries.length,
+        live,
+        done: visibleEntries.length - live,
+    };
+}
+function isActiveTodo(todo) {
+    return todo.status === "in_progress" || todo.status === "running";
+}
+function findCurrentTodo(todos) {
+    return todos.find(isActiveTodo) ?? todos.find((todo) => todo.status === "pending");
+}
+function getTodoText(todo) {
+    return todo.content ?? todo.text ?? todo.title ?? "todo";
+}
+function formatFloatingActivity(entries, todos, tickNow) {
+    const running = entries.find((entry) => entry.status === "running");
+    if (running) {
+        if (running.kind === "main") {
+            const frame = MAIN_AGENT_SPINNER_FRAMES[Math.floor(tickNow / TICK_INTERVAL_MS) % MAIN_AGENT_SPINNER_FRAMES.length];
+            return `${running.agent} Running ${frame}`;
+        }
+        return `${running.agent} Running ${formatDuration(tickNow - running.startedAt)}`;
+    }
+    const queued = entries.find((entry) => entry.status === "queued");
+    if (queued)
+        return `${queued.agent} Queued`;
+    const errored = entries.find((entry) => entry.status === "error");
+    if (errored)
+        return `${errored.agent} Error`;
+    const todo = findCurrentTodo(todos);
+    if (todo)
+        return `Todo: ${getTodoText(todo)}`;
+    return "idle";
+}
 function hasLiveEntries(active) {
     for (const entry of active.values()) {
         if (entry.status === "queued" || entry.status === "running")
@@ -510,17 +778,64 @@ function isLive(entry) {
 function isExpired(completedAt, now) {
     return now - completedAt > COMPLETION_RETENTION_MS;
 }
-function appendGroup(nodes, label, entries, tickNow, showLabel) {
+function appendGroup(nodes, label, entries, tickNow, showLabel, maxWidth) {
     if (entries.length === 0)
         return;
     if (showLabel)
-        nodes.push(renderMutedLine(`  ${label}`));
+        nodes.push(renderMutedLine(truncateToWidth(`  ${label}`, maxWidth)));
     for (const entry of entries) {
-        nodes.push(renderAgentLine(entry, tickNow));
-        const desc = renderDescriptionLine(entry);
+        nodes.push(renderAgentLine(entry, tickNow, maxWidth));
+        const desc = renderDescriptionLine(entry, maxWidth);
         if (desc)
             nodes.push(desc);
     }
+}
+function renderFloatingTodoRows(todos, width) {
+    const rows = [];
+    if (todos.length === 0) {
+        rows.push(renderMutedLine(truncate("  none", width)));
+        return rows;
+    }
+    for (const todo of todos) {
+        rows.push(makeText(truncate(`${formatTodoStatusMarker(todo.status)} ${getTodoText(todo)}`, width), {
+            fg: pickTodoStatusColor(todo.status),
+        }));
+    }
+    return rows;
+}
+function limitFloatingAgentRows(rows, maxRows, width) {
+    if (rows.length <= maxRows)
+        return rows;
+    if (maxRows <= 0)
+        return [];
+    const hiddenRows = rows.length - maxRows + 1;
+    return [...rows.slice(0, maxRows - 1), renderMutedLine(truncate(`... ${hiddenRows} more agent lines`, width))];
+}
+function limitFloatingTodoRows(rows, maxRows, todos, width) {
+    if (rows.length <= maxRows)
+        return rows;
+    if (maxRows <= 0)
+        return [];
+    const hiddenTodos = Math.max(1, todos.length - maxRows + 1);
+    return [...rows.slice(0, maxRows - 1), renderMutedLine(truncate(`... ${hiddenTodos} more todos`, width))];
+}
+function formatTodoStatusMarker(status) {
+    if (status === "completed")
+        return "✓";
+    if (status === "in_progress" || status === "running")
+        return "●";
+    if (status === "cancelled" || status === "canceled")
+        return "×";
+    return "○";
+}
+function pickTodoStatusColor(status) {
+    if (status === "completed")
+        return "gray";
+    if (status === "in_progress" || status === "running")
+        return "white";
+    if (status === "cancelled" || status === "canceled")
+        return "red";
+    return "gray";
 }
 function renderHeader(total, live, done, isCollapsed, status, onToggle) {
     const chevron = isCollapsed ? "▶" : "▼";
@@ -550,25 +865,25 @@ function buildCountSuffix(total, live, done) {
         return `(${done} done)`;
     return `(${live})`;
 }
-function renderAgentLine(entry, tickNow) {
+function renderAgentLine(entry, tickNow, maxWidth) {
     if (entry.kind === "main" && entry.status === "running") {
         const frame = MAIN_AGENT_SPINNER_FRAMES[Math.floor(tickNow / TICK_INTERVAL_MS) % MAIN_AGENT_SPINNER_FRAMES.length];
-        return makeText(`  • ${entry.agent} Running ${frame}`, {
+        return makeText(truncateToWidth(`  • ${entry.agent} Running ${frame}`, maxWidth), {
             fg: pickLineColor(entry),
         });
     }
     const elapsedMs = entry.completedAt ? entry.completedAt - entry.startedAt : tickNow - entry.startedAt;
     const elapsed = formatDuration(elapsedMs);
-    return makeText(`  • ${entry.agent} ${formatStatus(entry.status)} ${elapsed}`, {
+    return makeText(truncateToWidth(`  • ${entry.agent} ${formatStatus(entry.status)} ${elapsed}`, maxWidth), {
         fg: pickLineColor(entry),
     });
 }
-function renderDescriptionLine(entry) {
+function renderDescriptionLine(entry, maxWidth) {
     if (entry.description.length === 0)
         return undefined;
     if (entry.kind === "main" && entry.agent === entry.description)
         return undefined;
-    return makeText(`    ${truncate(entry.description, DESCRIPTION_MAX_LEN)}`, { fg: "gray" });
+    return makeText(truncateToWidth(`    ${truncate(entry.description, DESCRIPTION_MAX_LEN)}`, maxWidth), { fg: "gray" });
 }
 function formatStatus(status) {
     if (status === "queued")
@@ -600,9 +915,16 @@ function formatDuration(ms) {
     return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`;
 }
 function truncate(value, maxLen) {
+    if (maxLen <= 0)
+        return "";
     if (value.length <= maxLen)
         return value;
+    if (maxLen === 1)
+        return "…";
     return `${value.slice(0, maxLen - 1)}…`;
+}
+function truncateToWidth(value, maxWidth) {
+    return maxWidth === undefined ? value : truncate(value, maxWidth);
 }
 function makeText(content, props = {}) {
     const node = createElement("text");
